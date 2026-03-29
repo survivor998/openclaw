@@ -109,6 +109,32 @@ console.log(JSON.stringify({ file, guarded: !unguarded }, null, 2));
 if (unguarded) process.exit(42);
 NODE
 
+echo "==> Verifying webchat heartbeat runtime filter in control-ui bundle"
+node - <<'NODE'
+const { execSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const root = execSync("npm root -g", { encoding: "utf8" }).trim();
+const assetsDir = path.join(root, "openclaw", "dist", "control-ui", "assets");
+if (!fs.existsSync(assetsDir)) {
+  console.error(`control-ui assets not found: ${assetsDir}`);
+  process.exit(2);
+}
+const files = fs.readdirSync(assetsDir).filter((f) => f.startsWith("index-") && f.endsWith(".js"));
+if (files.length === 0) {
+  console.error("control-ui index bundle not found");
+  process.exit(2);
+}
+const bundlePath = path.join(assetsDir, files.sort().at(-1));
+const text = fs.readFileSync(bundlePath, "utf8");
+const hasRuntimeHeartbeatFilter =
+  text.includes("isHeartbeatTextStream") &&
+  text.includes("HEARTBEAT_PROMPT_PREFIX") &&
+  text.includes("isHeartbeatMessage");
+console.log(JSON.stringify({ bundlePath, hasRuntimeHeartbeatFilter }, null, 2));
+if (!hasRuntimeHeartbeatFilter) process.exit(42);
+NODE
+
 echo "==> Verifying model failover resilience"
 node - <<'NODE'
 const fs = require("fs");

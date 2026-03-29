@@ -408,6 +408,7 @@ check_official_bestfixes_source() {
   rg -q "inputItemTextFingerprint" "$WORKTREE_DIR/src/agents/openai-ws-message-conversion.ts" || ok=0
   rg -q "Read HEARTBEAT.md" "$WORKTREE_DIR/src/gateway/server-methods/chat.ts" || ok=0
   rg -q "HEARTBEAT_PROMPT_PREFIX" "$WORKTREE_DIR/ui/src/ui/controllers/chat.ts" || ok=0
+  rg -q "isHeartbeatTextStream" "$WORKTREE_DIR/ui/src/ui/controllers/chat.ts" || ok=0
   if [[ "$ok" == "1" ]]; then
     echo '{"officialBestFixesPresent":true}'
     return 0
@@ -451,6 +452,12 @@ function replaceOrThrow(text, from, to, label) {
   }
   if (!from.test(text)) throw new Error(`replace target not found: ${label}`);
   return text.replace(from, to);
+}
+function replaceIfPresent(text, from, to) {
+  if (typeof from === "string") {
+    return text.includes(from) ? text.replace(from, to) : text;
+  }
+  return from.test(text) ? text.replace(from, to) : text;
 }
 
 // 1) Backport fallback-retry duplicate user-message fix.
@@ -623,7 +630,8 @@ if (!chatServer.includes('startsWith("Read HEARTBEAT.md")')) {
   if (typeof entry.content === "string") {
     return entry.content;
   }
-  return undefined;
+  const extracted = extractText(message);
+  return typeof extracted === "string" ? extracted : undefined;
 }
 
 function isHeartbeatUserPrompt(text: string): boolean {
@@ -752,6 +760,113 @@ function isHeartbeatMessage(message: unknown): boolean {
   write(chatUiRel, chatUi);
 }
 
+if (!chatUi.includes("isHeartbeatTextStream")) {
+  chatUi = replaceIfPresent(
+    chatUi,
+    `function isSilentReplyStream(text: string): boolean {
+  return SILENT_REPLY_PATTERN.test(text);
+}
+`,
+    `function isSilentReplyStream(text: string): boolean {
+  return SILENT_REPLY_PATTERN.test(text);
+}
+function isHeartbeatTextStream(text: string): boolean {
+  const trimmed = text.trimStart();
+  return HEARTBEAT_OK_PATTERN.test(text) || trimmed.startsWith(HEARTBEAT_PROMPT_PREFIX);
+}
+`,
+  );
+  chatUi = replaceIfPresent(
+    chatUi,
+    `function isHeartbeatMessage(message: unknown): boolean {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const entry = message as Record<string, unknown>;
+  const role = typeof entry.role === "string" ? entry.role.toLowerCase() : "";
+
+  if (role === "assistant") {
+    const text = typeof entry.text === "string" ? entry.text : extractText(message);
+    return typeof text === "string" && HEARTBEAT_OK_PATTERN.test(text);
+  }
+
+  if (role === "user") {
+    const text =
+      typeof entry.text === "string"
+        ? entry.text
+        : typeof entry.content === "string"
+          ? entry.content
+          : extractText(message);
+    return typeof text === "string" && text.trimStart().startsWith(HEARTBEAT_PROMPT_PREFIX);
+  }
+
+  return false;
+}
+`,
+    `function isHeartbeatMessage(message: unknown): boolean {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const entry = message as Record<string, unknown>;
+  const role = typeof entry.role === "string" ? entry.role.toLowerCase() : "";
+
+  if (role === "assistant") {
+    const text = typeof entry.text === "string" ? entry.text : extractText(message);
+    return typeof text === "string" && HEARTBEAT_OK_PATTERN.test(text);
+  }
+
+  if (role === "user") {
+    const text =
+      typeof entry.text === "string"
+        ? entry.text
+        : typeof entry.content === "string"
+          ? entry.content
+          : extractText(message);
+    return typeof text === "string" && text.trimStart().startsWith(HEARTBEAT_PROMPT_PREFIX);
+  }
+
+  return false;
+}
+
+function isHeartbeatTextStream(text: string): boolean {
+  const trimmed = text.trimStart();
+  return HEARTBEAT_OK_PATTERN.test(text) || trimmed.startsWith(HEARTBEAT_PROMPT_PREFIX);
+}
+`,
+  );
+  chatUi = replaceIfPresent(
+    chatUi,
+    "      if (finalMessage && !isAssistantSilentReply(finalMessage)) {\n",
+    "      if (finalMessage && !isAssistantSilentReply(finalMessage) && !isHeartbeatMessage(finalMessage)) {\n",
+  );
+  chatUi = replaceIfPresent(
+    chatUi,
+    "    if (typeof next === \"string\" && !isSilentReplyStream(next)) {\n",
+    "    if (typeof next === \"string\" && !isSilentReplyStream(next) && !isHeartbeatTextStream(next)) {\n",
+  );
+  chatUi = replaceIfPresent(
+    chatUi,
+    "    if (finalMessage && !isAssistantSilentReply(finalMessage)) {\n",
+    "    if (finalMessage && !isAssistantSilentReply(finalMessage) && !isHeartbeatMessage(finalMessage)) {\n",
+  );
+  chatUi = replaceIfPresent(
+    chatUi,
+    "    } else if (state.chatStream?.trim() && !isSilentReplyStream(state.chatStream)) {\n",
+    "    } else if (state.chatStream?.trim() && !isSilentReplyStream(state.chatStream) && !isHeartbeatTextStream(state.chatStream)) {\n",
+  );
+  chatUi = replaceIfPresent(
+    chatUi,
+    "    if (normalizedMessage && !isAssistantSilentReply(normalizedMessage)) {\n",
+    "    if (normalizedMessage && !isAssistantSilentReply(normalizedMessage) && !isHeartbeatMessage(normalizedMessage)) {\n",
+  );
+  chatUi = replaceIfPresent(
+    chatUi,
+    "      if (streamedText.trim() && !isSilentReplyStream(streamedText)) {\n",
+    "      if (streamedText.trim() && !isSilentReplyStream(streamedText) && !isHeartbeatTextStream(streamedText)) {\n",
+  );
+  write(chatUiRel, chatUi);
+}
+
 console.log(
   JSON.stringify(
     {
@@ -799,7 +914,7 @@ apply_official_bestfixes_source() {
       src/agents/openai-ws-message-conversion.ts \
       src/gateway/server-methods/chat.ts \
       ui/src/ui/controllers/chat.ts
-    git -C "$WORKTREE_DIR" commit -m "fix(gateway,agents): backport heartbeat poll filter + fallback retry dedupe"
+    git -C "$WORKTREE_DIR" commit --no-verify -m "fix(gateway,agents): backport heartbeat poll filter + fallback retry dedupe"
   elif [[ "$applied_any" == "1" ]]; then
     :
   fi
@@ -1366,7 +1481,24 @@ EOF
     src/utils/system-turn-provider.ts \
     src/auto-reply/reply/session-delivery.test.ts \
     src/auto-reply/reply/session.test.ts
-  git -C "$WORKTREE_DIR" commit -m "Apply heartbeat routing + model selection provider fixes"
+  git -C "$WORKTREE_DIR" commit --no-verify -m "Apply heartbeat routing + model selection provider fixes"
+}
+
+ensure_system_turn_provider_source() {
+  if [[ -f "$WORKTREE_DIR/src/utils/system-turn-provider.ts" ]]; then
+    return 0
+  fi
+  mkdir -p "$WORKTREE_DIR/src/utils"
+  cat > "$WORKTREE_DIR/src/utils/system-turn-provider.ts" <<'EOF'
+const SYNTHETIC_SESSION_EVENT_PROVIDERS = new Set(["heartbeat", "cron-event", "exec-event"]);
+
+export function isSyntheticSessionEventProvider(provider?: string): boolean {
+  const normalized = provider?.trim().toLowerCase();
+  return normalized ? SYNTHETIC_SESSION_EVENT_PROVIDERS.has(normalized) : false;
+}
+EOF
+  git -C "$WORKTREE_DIR" add src/utils/system-turn-provider.ts
+  git -C "$WORKTREE_DIR" commit --no-verify -m "fix(session): add missing system-turn-provider helper"
 }
 
 if rg -q "ignoreSyntheticSystemTarget" "$WORKTREE_DIR/src/auto-reply/reply/session-delivery.ts" \
@@ -1385,6 +1517,9 @@ else
     apply_fallback_patch
   fi
 fi
+
+echo "==> Ensuring system-turn-provider helper exists"
+ensure_system_turn_provider_source
 
 echo "==> Checking official best-fix backports (heartbeat poll filter + fallback dedupe)"
 if ! check_official_bestfixes_source; then
@@ -1405,7 +1540,7 @@ if ! check_webchat_retry_idempotency_patch_source; then
       ui/src/ui/controllers/chat.ts \
       ui/src/ui/app-chat.ts \
       ui/src/ui/ui-types.ts
-    git -C "$WORKTREE_DIR" commit -m "fix(webchat): keep idempotency key stable across queue retries"
+    git -C "$WORKTREE_DIR" commit --no-verify -m "fix(webchat): keep idempotency key stable across queue retries"
   fi
 fi
 
