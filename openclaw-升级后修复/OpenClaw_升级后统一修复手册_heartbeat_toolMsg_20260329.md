@@ -74,6 +74,25 @@
 ~/Desktop/openclaw-safe-upgrade.sh 2026.3.28
 ```
 
+## 4.1 新增：npm 安装卡住自动恢复（2026-03-29 晚）
+
+已针对以下真实故障做脚本级修复：
+
+- `npm install -g openclaw@...` 卡在 `@matrix-org/matrix-sdk-crypto-nodejs` 的 `download-lib.js`
+- `ENOTEMPTY: rename .../node_modules/openclaw -> .../.openclaw-*` 临时目录残留冲突
+
+现在两个脚本都内置：
+
+1. 安装命令超时监控（默认 900 秒）
+2. 超时后自动杀掉安装进程树
+3. 清理全局 `node_modules/.openclaw-*` 残留目录
+4. 自动回退重试：`npm install -g --ignore-scripts ...`
+
+可选环境变量：
+
+- `OPENCLAW_SAFE_UPGRADE_INSTALL_TIMEOUT_SEC`（默认 `900`）
+- `OPENCLAW_REAPPLY_INSTALL_TIMEOUT_SEC`（默认 `900`）
+
 ## 5. 快速核验
 
 ### 5.1 Heartbeat 主会话污染

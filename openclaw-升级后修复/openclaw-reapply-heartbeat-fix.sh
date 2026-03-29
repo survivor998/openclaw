@@ -12,6 +12,7 @@ FETCH_LOW_SPEED_TIME="${OPENCLAW_FIX_FETCH_LOW_SPEED_TIME:-20}"
 OFFICIAL_DUPLICATE_RETRY_FIX_COMMIT_1="${OPENCLAW_OFFICIAL_DUP_RETRY_FIX_COMMIT_1:-effb9cb3948ed9a8366042093de8a3eaa44875f2}"
 OFFICIAL_DUPLICATE_RETRY_FIX_COMMIT_2="${OPENCLAW_OFFICIAL_DUP_RETRY_FIX_COMMIT_2:-a63afd8ce043405561889c5fcb4f0965ad1edf06}"
 OFFICIAL_HEARTBEAT_POLL_FILTER_COMMIT="${OPENCLAW_OFFICIAL_HEARTBEAT_POLL_FILTER_COMMIT:-b92c49b3e083559dcd84e1a42d57246781dacbb6}"
+INSTALL_TIMEOUT_SEC="${OPENCLAW_REAPPLY_INSTALL_TIMEOUT_SEC:-900}"
 
 if ! command -v openclaw >/dev/null 2>&1; then
   echo "openclaw command not found in PATH" >&2
@@ -70,6 +71,57 @@ resolve_tag() {
   fi
   echo ""
   return 1
+}
+
+kill_process_tree() {
+  local pid="$1"
+  local children
+  children="$(pgrep -P "$pid" 2>/dev/null || true)"
+  if [[ -n "$children" ]]; then
+    while IFS= read -r child; do
+      [[ -n "$child" ]] && kill_process_tree "$child"
+    done <<< "$children"
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  sleep 1
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+run_with_timeout() {
+  local timeout_sec="$1"
+  shift
+  "$@" &
+  local pid=$!
+  local start=$SECONDS
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( SECONDS - start >= timeout_sec )); then
+      echo "warn: command timed out after ${timeout_sec}s: $*" >&2
+      kill_process_tree "$pid"
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 2
+  done
+  wait "$pid"
+}
+
+cleanup_openclaw_staging_dirs() {
+  local npm_root
+  npm_root="$(npm root -g 2>/dev/null | tr -d '\r')"
+  if [[ -n "$npm_root" && -d "$npm_root" ]]; then
+    rm -rf "$npm_root"/.openclaw-* 2>/dev/null || true
+  fi
+}
+
+install_packed_build_global() {
+  local tgz_path="$1"
+  cleanup_openclaw_staging_dirs
+  if run_with_timeout "$INSTALL_TIMEOUT_SEC" npm install -g "$tgz_path"; then
+    return 0
+  fi
+  echo "warn: npm install -g $tgz_path failed or timed out; retrying with --ignore-scripts" >&2
+  cleanup_openclaw_staging_dirs
+  run_with_timeout "$INSTALL_TIMEOUT_SEC" npm install -g --ignore-scripts "$tgz_path"
 }
 
 cleanup_worktree_locks() {
@@ -1382,7 +1434,7 @@ echo "==> Packing patched build"
 PACKAGE_TGZ="$(cd "$WORKTREE_DIR" && npm pack | tail -n 1)"
 
 echo "==> Installing patched build globally"
-npm install -g "$WORKTREE_DIR/$PACKAGE_TGZ"
+install_packed_build_global "$WORKTREE_DIR/$PACKAGE_TGZ"
 
 echo "==> Checking toolMsg.content.filter guard status"
 if ! check_toolmsg_filter_guard_installed; then

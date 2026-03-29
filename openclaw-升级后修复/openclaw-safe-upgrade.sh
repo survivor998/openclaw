@@ -3,6 +3,7 @@ set -euo pipefail
 
 TARGET_VERSION="${1:-latest}"
 REAPPLY_SCRIPT="$HOME/Desktop/openclaw-reapply-heartbeat-fix.sh"
+INSTALL_TIMEOUT_SEC="${OPENCLAW_SAFE_UPGRADE_INSTALL_TIMEOUT_SEC:-900}"
 
 if ! command -v npm >/dev/null 2>&1; then
   echo "npm command not found in PATH" >&2
@@ -17,11 +18,62 @@ if [[ ! -x "$REAPPLY_SCRIPT" ]]; then
   exit 1
 fi
 
+kill_process_tree() {
+  local pid="$1"
+  local children
+  children="$(pgrep -P "$pid" 2>/dev/null || true)"
+  if [[ -n "$children" ]]; then
+    while IFS= read -r child; do
+      [[ -n "$child" ]] && kill_process_tree "$child"
+    done <<< "$children"
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  sleep 1
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+run_with_timeout() {
+  local timeout_sec="$1"
+  shift
+  "$@" &
+  local pid=$!
+  local start=$SECONDS
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( SECONDS - start >= timeout_sec )); then
+      echo "warn: command timed out after ${timeout_sec}s: $*" >&2
+      kill_process_tree "$pid"
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 2
+  done
+  wait "$pid"
+}
+
+cleanup_openclaw_staging_dirs() {
+  local npm_root
+  npm_root="$(npm root -g 2>/dev/null | tr -d '\r')"
+  if [[ -n "$npm_root" && -d "$npm_root" ]]; then
+    rm -rf "$npm_root"/.openclaw-* 2>/dev/null || true
+  fi
+}
+
+install_official_openclaw_with_fallback() {
+  local spec="$1"
+  cleanup_openclaw_staging_dirs
+  if run_with_timeout "$INSTALL_TIMEOUT_SEC" npm install -g "$spec"; then
+    return 0
+  fi
+  echo "warn: npm install -g $spec failed or timed out; retrying with --ignore-scripts" >&2
+  cleanup_openclaw_staging_dirs
+  run_with_timeout "$INSTALL_TIMEOUT_SEC" npm install -g --ignore-scripts "$spec"
+}
+
 echo "==> Upgrading OpenClaw to: $TARGET_VERSION"
 if [[ "$TARGET_VERSION" == "latest" ]]; then
-  npm install -g openclaw@latest
+  install_official_openclaw_with_fallback "openclaw@latest"
 else
-  npm install -g "openclaw@$TARGET_VERSION"
+  install_official_openclaw_with_fallback "openclaw@$TARGET_VERSION"
 fi
 
 echo "==> Version after official upgrade"
