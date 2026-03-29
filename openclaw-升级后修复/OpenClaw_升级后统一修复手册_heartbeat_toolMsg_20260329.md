@@ -1,80 +1,82 @@
-# OpenClaw 升级后统一修复手册（Heartbeat + toolMsg + WebChat重复显示）
+# OpenClaw 升级后统一修复手册（Heartbeat + toolMsg + WebChat 重复显示）
 
-更新时间：2026-03-29 21:05 CST  
+更新时间：2026-03-29 22:05 CST  
 分析报告：`/tmp/openclaw-log-analysis-report-2026-03-29.md`
 
-## 1. 官方状态（以 2026-03-29 检索结果为准）
+## 1. 官方仓库最新结论（2026-03-29）
 
-| 项目                                                       | 官方仓库状态                                 | 是否写入脚本自动处理 |
-| ---------------------------------------------------------- | -------------------------------------------- | -------------------- |
-| Heartbeat 污染主会话（`agent:main:main` 被写成 heartbeat） | **未确认已官方发布修复到 2026.3.28**         | 是                   |
-| `toolMsg.content.filter` 崩溃                              | **2026.3.28 仍可能触发**（依赖链中仍有风险） | 是                   |
-| Web 端“输入一次显示两次/重复请求”                          | **仍有开放 issue**（见下方）                 | 是                   |
-| skills symlink_escape 历史漏洞                             | **官方已修复（2026.2.25 后）**               | 否                   |
+| 问题                                                                            | 官方状态                                                                                                                                                     | 处理策略                                          |
+| ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------- |
+| Heartbeat 污染主会话元数据（`lastTo/deliveryContext/origin` 被 heartbeat 覆盖） | 未确认已在 2026.3.28/2026.3.29 官方包完全覆盖                                                                                                                | 保留源码级修复 + 升级后自动巡检与清理             |
+| `toolMsg.content.filter is not a function`                                      | 仍存在升级后回归风险（依赖链/构建差异）                                                                                                                      | 保留安装后自动检测与热修                          |
+| WebChat 单次输入出现重复 user 消息（fallback/retry 引发）                       | 官方有修复 PR 但未确认已进入你的安装包：[#52903](https://github.com/openclaw/openclaw/pull/52903)                                                            | 脚本优先应用官方 commit，失败则本地 fallback 补丁 |
+| WebChat 显示 heartbeat poll 文本（`Read HEARTBEAT.md...`）                      | 仍为官方已知问题：[#49374](https://github.com/openclaw/openclaw/issues/49374)；对应修复 PR 未合并：[#36899](https://github.com/openclaw/openclaw/pull/36899) | 脚本回补 gateway + UI 过滤                        |
+| Control UI 上一条内容粘到下一条（composer duplication）                         | 官方 open：[#24022](https://github.com/openclaw/openclaw/issues/24022)                                                                                       | 脚本保留队列重试 runId/idempotencyKey 稳定化补丁  |
 
-## 2. Web 端“输入一次显示两次”结论
+## 2. 本次采用的“官方最佳可落地方案”
 
-### 2.1 你本机日志侧证据
+### 2.1 重复 user 消息（fallback/retry）
 
-- 当前主会话 jsonl 未稳定出现“后端双写”型重复（同一条 user 入库两次）。
-- 但 `gateway.log` 存在高频 `webchat connected/disconnected`（重连风暴），会放大前端重试/重放问题。
+优先应用官方提交：
 
-### 2.2 官方仓库相关 issue（联网）
+- `effb9cb3948ed9a8366042093de8a3eaa44875f2`
+- `a63afd8ce043405561889c5fcb4f0965ad1edf06`
 
-- [#28471 Webchat: missed messages after WebSocket reconnect (no catch-up mechanism)](https://github.com/openclaw/openclaw/issues/28471)（Open，2026-03-28 仍更新）
-- [#56485 openclaw-control-ui: duplicate reflection requests and missing image attachment support](https://github.com/openclaw/openclaw/issues/56485)（Open，2026-03-28）
-- [#24022 Control UI: previous message sometimes gets pasted into the next message (composer duplication)](https://github.com/openclaw/openclaw/issues/24022)（Open）
+核心思路：
 
-结论：这类问题在官方仓库仍属于活跃缺陷范围，不是你单机偶发错觉。
+1. 在 `session-manager-init` 重试前剥离 trailing orphaned user messages。
+2. 在 OpenAI WS 输入转换阶段，对“相邻且相同指纹”的 user message 去重（保留真实不同输入）。
 
-### 2.3 官方最佳实践（可执行）
+### 2.2 Heartbeat poll 泄露到 WebChat 历史
 
-1. 客户端重试必须复用同一个 `idempotencyKey`（不能每次重试生成新 key）。
-2. 网关侧必须按 `idempotencyKey` 幂等处理（OpenClaw `chat.send` 已具备该能力）。
-3. 前端要做 optimistic 消息去重（同一 `idempotencyKey` 只渲染一次）。
-4. 重连后需要 history catch-up，避免“丢消息后人工重复发送”。
+优先参考官方 PR（未合并）中的实现：
 
-## 3. 三个文件当前整合内容
+- `b92c49b3e083559dcd84e1a42d57246781dacbb6`（PR #36899）
+
+核心思路：
+
+1. Gateway `chat.history` 过滤：
+   - assistant 纯 `HEARTBEAT_OK`
+   - user 端 heartbeat poll 前缀（`Read HEARTBEAT.md`）
+2. UI `chat.history` 再做 defense-in-depth 过滤，避免漏网。
+
+## 3. 三个文件已经整合的能力
 
 ### 3.1 `~/Desktop/openclaw-reapply-heartbeat-fix.sh`
 
-当前脚本会自动执行：
+当前脚本按如下顺序执行：
 
-1. Heartbeat 污染修复（源码复打 + store 清理校验）
-2. `toolMsg.content.filter` 自动检测、热修、复检
-3. **WebChat 重复发送/重复显示防护补丁**（新增）
-   - 在 UI 源码里把 queue/retry 路径改成复用同一 `runId/idempotencyKey`
-   - 对 optimistic user message 增加 `idempotencyKey` 去重
-   - 追加 UI 回归测试：`ui/src/ui/controllers/chat.test.ts`、`ui/src/ui/app-chat.test.ts`
-4. Telegram 多 token 自动 `deleteWebhook`
-5. 模型故障转移健康检查（primary/fallback/provider diversity）
-6. Telegram/Discord retry 基线补齐（缺省时）
-7. DNS 健康检查（`api.telegram.org` / `open.feishu.cn`）
-8. 日志热点排序（新增 WebChat duplicate/reconnect 分类）
+1. Heartbeat 主会话污染修复（源码级 + 安装后巡检）
+2. 官方最佳修复回补（commit 优先，失败 fallback）：
+   - fallback/retry 重复 user message 去重
+   - heartbeat poll 历史过滤（gateway + UI）
+3. WebChat 队列重试 runId/idempotencyKey 稳定化补丁（应对 #24022 类表现）
+4. `toolMsg.content.filter` 检测与热修
+5. Telegram webhook 清理、模型 failover 基线、重试策略、DNS 健康检查、日志热点排序。
 
 ### 3.2 `~/Desktop/openclaw-safe-upgrade.sh`
 
-当前脚本会自动执行：
+升级流程：
 
-1. 官方升级
-2. 调用 `openclaw-reapply-heartbeat-fix.sh`
-3. 二次校验：toolMsg、防故障转移、DNS
-4. 日志热点摘要（含 WebChat duplicate/reconnect）
-5. **新增 24 小时 WebChat 重复诊断**：
-   - `webchat connected/disconnected` 次数
-   - 当前主会话 transcript 的重复消息桶统计
+1. 安装官方版本（latest 或指定版本）
+2. 调用 `openclaw-reapply-heartbeat-fix.sh` 自动回补
+3. 二次校验：toolMsg、防故障转移、DNS、日志热点
+4. 新增 24h 诊断指标：
+   - webchat connect/disconnect 次数
+   - transcript 重复消息桶计数
+   - `heartbeatPollVisibleCount`
 
-## 4. 推荐执行
+## 4. 推荐命令
 
 ```bash
 ~/Desktop/openclaw-safe-upgrade.sh
-# 或明确版本
+# 或
 ~/Desktop/openclaw-safe-upgrade.sh 2026.3.28
 ```
 
-## 5. 快速核验命令
+## 5. 快速核验
 
-### 5.1 Heartbeat 污染
+### 5.1 Heartbeat 主会话污染
 
 ```bash
 node -e '
@@ -88,14 +90,13 @@ console.log(JSON.stringify({
 '
 ```
 
-### 5.2 toolMsg/content.filter 防护
+### 5.2 WebChat heartbeat poll 可见性
 
 ```bash
-AGENT_LOOP="$(npm root -g)/openclaw/node_modules/@mariozechner/pi-agent-core/dist/agent-loop.js"
-rg -n "message\.content\.filter\(\(c\)|assistantMessage\.content\.filter\(\(c\)|Array\.isArray\(message\.content\)|Array\.isArray\(assistantMessage\.content\)" "$AGENT_LOOP"
+rg -n "Read HEARTBEAT\.md" ~/.openclaw/agents/main/sessions/*.jsonl | tail -n 30
 ```
 
-### 5.3 WebChat 重连风暴（最近24小时）
+### 5.3 WebChat 重连风暴
 
 ```bash
 rg -n "\[ws\] webchat (connected|disconnected)" ~/.openclaw/logs/gateway.log ~/.openclaw/logs/gateway.err.log | tail -n 80
@@ -103,5 +104,5 @@ rg -n "\[ws\] webchat (connected|disconnected)" ~/.openclaw/logs/gateway.log ~/.
 
 ## 6. 备注
 
-- 今天（2026-03-29）联网核对后，WebChat 重复显示相关问题仍有官方开放 issue。
-- 因此该项已并入本地“升级后统一修复流程”，避免每次升级回归。
+- 这次整合遵循你的要求：只把“官方最新版仍可能存在”的问题写入脚本；已明确官方彻底修复并进入稳定发布的项目不再单独维护补丁。
+- 若后续官方 release notes 明确包含上述 commit/同等修复，可在脚本中删除对应 fallback 补丁分支。

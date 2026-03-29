@@ -9,6 +9,9 @@ WORKTREE_ROOT="${OPENCLAW_FIX_WORKTREES:-$HOME/Documents/New project/openclaw-fi
 FETCH_ATTEMPTS="${OPENCLAW_FIX_FETCH_ATTEMPTS:-3}"
 FETCH_LOW_SPEED_LIMIT="${OPENCLAW_FIX_FETCH_LOW_SPEED_LIMIT:-1024}"
 FETCH_LOW_SPEED_TIME="${OPENCLAW_FIX_FETCH_LOW_SPEED_TIME:-20}"
+OFFICIAL_DUPLICATE_RETRY_FIX_COMMIT_1="${OPENCLAW_OFFICIAL_DUP_RETRY_FIX_COMMIT_1:-effb9cb3948ed9a8366042093de8a3eaa44875f2}"
+OFFICIAL_DUPLICATE_RETRY_FIX_COMMIT_2="${OPENCLAW_OFFICIAL_DUP_RETRY_FIX_COMMIT_2:-a63afd8ce043405561889c5fcb4f0965ad1edf06}"
+OFFICIAL_HEARTBEAT_POLL_FILTER_COMMIT="${OPENCLAW_OFFICIAL_HEARTBEAT_POLL_FILTER_COMMIT:-b92c49b3e083559dcd84e1a42d57246781dacbb6}"
 
 if ! command -v openclaw >/dev/null 2>&1; then
   echo "openclaw command not found in PATH" >&2
@@ -344,6 +347,410 @@ cfg.channels = channels;
 if (changed) fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n");
 console.log(JSON.stringify({ changed, telegramRetry: channels.telegram?.retry, discordRetry: channels.discord?.retry }, null, 2));
 NODE
+}
+
+check_official_bestfixes_source() {
+  local ok=1
+  rg -q "stripTrailingOrphanedUserMessages" "$WORKTREE_DIR/src/agents/pi-embedded-runner/session-manager-init.ts" || ok=0
+  rg -q "collapseConsecutiveUserMessages" "$WORKTREE_DIR/src/agents/openai-ws-message-conversion.ts" || ok=0
+  rg -q "inputItemTextFingerprint" "$WORKTREE_DIR/src/agents/openai-ws-message-conversion.ts" || ok=0
+  rg -q "Read HEARTBEAT.md" "$WORKTREE_DIR/src/gateway/server-methods/chat.ts" || ok=0
+  rg -q "HEARTBEAT_PROMPT_PREFIX" "$WORKTREE_DIR/ui/src/ui/controllers/chat.ts" || ok=0
+  if [[ "$ok" == "1" ]]; then
+    echo '{"officialBestFixesPresent":true}'
+    return 0
+  fi
+  echo '{"officialBestFixesPresent":false}'
+  return 42
+}
+
+try_cherry_pick_commit() {
+  local commit="$1"
+  if git -C "$WORKTREE_DIR" rev-parse --verify "${commit}^{commit}" >/dev/null 2>&1; then
+    if git -C "$WORKTREE_DIR" merge-base --is-ancestor "$commit" HEAD >/dev/null 2>&1; then
+      return 0
+    fi
+    if git -C "$WORKTREE_DIR" cherry-pick -x "$commit"; then
+      return 0
+    fi
+    git -C "$WORKTREE_DIR" cherry-pick --abort || true
+  fi
+  return 42
+}
+
+apply_official_bestfixes_fallback_patch_source() {
+  WORKTREE_DIR="$WORKTREE_DIR" node - <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const root = process.env.WORKTREE_DIR;
+if (!root) throw new Error("WORKTREE_DIR missing");
+
+function read(rel) {
+  return fs.readFileSync(path.join(root, rel), "utf8");
+}
+function write(rel, text) {
+  fs.writeFileSync(path.join(root, rel), text);
+}
+function replaceOrThrow(text, from, to, label) {
+  if (typeof from === "string") {
+    if (!text.includes(from)) throw new Error(`replace target not found: ${label}`);
+    return text.replace(from, to);
+  }
+  if (!from.test(text)) throw new Error(`replace target not found: ${label}`);
+  return text.replace(from, to);
+}
+
+// 1) Backport fallback-retry duplicate user-message fix.
+const smRel = "src/agents/pi-embedded-runner/session-manager-init.ts";
+let sm = read(smRel);
+if (!sm.includes("stripTrailingOrphanedUserMessages")) {
+  sm = replaceOrThrow(
+    sm,
+    'type SessionMessageEntry = { type: "message"; message?: { role?: string } };',
+    'type SessionMessageEntry = { type: "message"; id?: string; message?: { role?: string; stopReason?: string } };',
+    "session-manager message type",
+  );
+  sm = replaceOrThrow(
+    sm,
+    `  if (params.hadSessionFile && header && !hasAssistant) {
+    // Reset file so the first assistant flush includes header+user+assistant in order.
+    await fs.writeFile(params.sessionFile, "", "utf-8");
+    sm.fileEntries = [header];
+    sm.byId?.clear?.();
+    sm.labelsById?.clear?.();
+    sm.leafId = null;
+    sm.flushed = false;
+  }
+}
+`,
+    `  if (params.hadSessionFile && header && !hasAssistant) {
+    // Reset file so the first assistant flush includes header+user+assistant in order.
+    await fs.writeFile(params.sessionFile, "", "utf-8");
+    sm.fileEntries = [header];
+    sm.byId?.clear?.();
+    sm.labelsById?.clear?.();
+    sm.leafId = null;
+    sm.flushed = false;
+  }
+
+  if (params.hadSessionFile && header && hasAssistant) {
+    stripTrailingOrphanedUserMessages(sm);
+  }
+}
+
+function stripTrailingOrphanedUserMessages(sm: {
+  fileEntries: Array<SessionHeaderEntry | SessionMessageEntry | { type: string }>;
+  byId?: Map<string, unknown>;
+  leafId?: string | null;
+}): void {
+  let lastAssistantIdx = -1;
+  for (let i = sm.fileEntries.length - 1; i >= 0; i--) {
+    const e = sm.fileEntries[i];
+    if (e.type === "message" && (e as SessionMessageEntry).message?.role === "assistant") {
+      lastAssistantIdx = i;
+      break;
+    }
+  }
+  if (lastAssistantIdx < 0) return;
+
+  const indicesToRemove = [];
+  for (let i = lastAssistantIdx + 1; i < sm.fileEntries.length; i++) {
+    const e = sm.fileEntries[i];
+    if (e.type === "message" && (e as SessionMessageEntry).message?.role === "user") {
+      indicesToRemove.push(i);
+    }
+  }
+  if (indicesToRemove.length === 0) return;
+
+  for (const idx of indicesToRemove.reverse()) {
+    const removed = sm.fileEntries.splice(idx, 1)[0];
+    if (removed && typeof removed === "object" && "id" in removed && removed.id) {
+      sm.byId?.delete(removed.id);
+    }
+  }
+  const lastEntry = sm.fileEntries[sm.fileEntries.length - 1];
+  sm.leafId = lastEntry && typeof lastEntry === "object" && "id" in lastEntry ? lastEntry.id ?? null : null;
+}
+`,
+    "session-manager orphan-strip insertion",
+  );
+  write(smRel, sm);
+}
+
+const convRel = "src/agents/openai-ws-message-conversion.ts";
+let conv = read(convRel);
+if (!conv.includes("inputItemTextFingerprint")) {
+  conv = replaceOrThrow(
+    conv,
+    "  return items;\n}\n\n",
+    `  return collapseConsecutiveUserMessages(items);
+}
+
+function collapseConsecutiveUserMessages(items: InputItem[]): InputItem[] {
+  if (items.length <= 1) return items;
+  const out: InputItem[] = [];
+  for (const item of items) {
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      "role" in prev &&
+      prev.role === "user" &&
+      "role" in item &&
+      item.role === "user" &&
+      inputItemTextFingerprint(prev) === inputItemTextFingerprint(item)
+    ) {
+      out[out.length - 1] = item;
+      continue;
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+function inputItemTextFingerprint(item: InputItem): string {
+  if (!("content" in item)) return "";
+  const content = (item as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((c: { type?: string }) => c.type === "input_text")
+    .map((c: { text?: string }) => c.text ?? "")
+    .join("\\n");
+}
+
+`,
+    "message conversion dedupe insertion",
+  );
+  write(convRel, conv);
+}
+
+// 2) Backport heartbeat poll/history filtering for webchat.
+const chatServerRel = "src/gateway/server-methods/chat.ts";
+let chatServer = read(chatServerRel);
+if (!chatServer.includes('startsWith("Read HEARTBEAT.md")')) {
+  chatServer = replaceOrThrow(
+    chatServer,
+    "import { isSilentReplyText, SILENT_REPLY_TOKEN } from \"../../auto-reply/tokens.js\";",
+    "import { HEARTBEAT_TOKEN, isSilentReplyText, SILENT_REPLY_TOKEN } from \"../../auto-reply/tokens.js\";",
+    "chat.ts heartbeat token import",
+  );
+  chatServer = replaceOrThrow(
+    chatServer,
+    `function sanitizeChatHistoryMessages(messages: unknown[]): unknown[] {
+  if (messages.length === 0) {
+    return messages;
+  }
+  let changed = false;
+  const next: unknown[] = [];
+  for (const message of messages) {
+    const res = sanitizeChatHistoryMessage(message);
+    changed ||= res.changed;
+    // Drop assistant messages whose entire visible text is the silent reply token.
+    const text = extractAssistantTextForSilentCheck(res.message);
+    if (text !== undefined && isSilentReplyText(text, SILENT_REPLY_TOKEN)) {
+      changed = true;
+      continue;
+    }
+    next.push(res.message);
+  }
+  return changed ? next : messages;
+}
+`,
+    `function extractUserTextForHeartbeatCheck(message: unknown): string | undefined {
+  if (!message || typeof message !== "object") {
+    return undefined;
+  }
+  const entry = message as Record<string, unknown>;
+  if (entry.role !== "user") {
+    return undefined;
+  }
+  if (typeof entry.text === "string") {
+    return entry.text;
+  }
+  if (typeof entry.content === "string") {
+    return entry.content;
+  }
+  return undefined;
+}
+
+function isHeartbeatUserPrompt(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return trimmed.startsWith("Read HEARTBEAT.md");
+}
+
+function sanitizeChatHistoryMessages(messages: unknown[]): unknown[] {
+  if (messages.length === 0) {
+    return messages;
+  }
+  let changed = false;
+  const next: unknown[] = [];
+  for (const message of messages) {
+    const res = sanitizeChatHistoryMessage(message);
+    changed ||= res.changed;
+    // Drop assistant messages whose entire visible text is the silent reply token.
+    const text = extractAssistantTextForSilentCheck(res.message);
+    if (text !== undefined && isSilentReplyText(text, SILENT_REPLY_TOKEN)) {
+      changed = true;
+      continue;
+    }
+    // Drop assistant heartbeat ack messages.
+    if (text !== undefined && isSilentReplyText(text, HEARTBEAT_TOKEN)) {
+      changed = true;
+      continue;
+    }
+    // Drop user heartbeat poll prompts.
+    const userText = extractUserTextForHeartbeatCheck(res.message);
+    if (userText !== undefined && isHeartbeatUserPrompt(userText)) {
+      changed = true;
+      continue;
+    }
+    next.push(res.message);
+  }
+  return changed ? next : messages;
+}
+`,
+    "chat.ts sanitize history heartbeat filtering",
+  );
+  write(chatServerRel, chatServer);
+}
+
+const chatUiRel = "ui/src/ui/controllers/chat.ts";
+let chatUi = read(chatUiRel);
+if (!chatUi.includes("HEARTBEAT_PROMPT_PREFIX")) {
+  chatUi = replaceOrThrow(
+    chatUi,
+    "const SILENT_REPLY_PATTERN = /^\\s*NO_REPLY\\s*$/;\n",
+    `const SILENT_REPLY_PATTERN = /^\\s*NO_REPLY\\s*$/;
+const HEARTBEAT_OK_PATTERN = /^\\s*HEARTBEAT_OK\\s*$/;
+const HEARTBEAT_PROMPT_PREFIX = "Read HEARTBEAT.md";
+`,
+    "chat ui heartbeat constants",
+  );
+  chatUi = replaceOrThrow(
+    chatUi,
+    `function isAssistantSilentReply(message: unknown): boolean {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const entry = message as Record<string, unknown>;
+  const role = typeof entry.role === "string" ? entry.role.toLowerCase() : "";
+  if (role !== "assistant") {
+    return false;
+  }
+  // entry.text takes precedence — matches gateway extractAssistantTextForSilentCheck
+  if (typeof entry.text === "string") {
+    return isSilentReplyStream(entry.text);
+  }
+  const text = extractText(message);
+  return typeof text === "string" && isSilentReplyStream(text);
+}
+`,
+    `function isAssistantSilentReply(message: unknown): boolean {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const entry = message as Record<string, unknown>;
+  const role = typeof entry.role === "string" ? entry.role.toLowerCase() : "";
+  if (role !== "assistant") {
+    return false;
+  }
+  // entry.text takes precedence — matches gateway extractAssistantTextForSilentCheck
+  if (typeof entry.text === "string") {
+    return isSilentReplyStream(entry.text);
+  }
+  const text = extractText(message);
+  return typeof text === "string" && isSilentReplyStream(text);
+}
+
+function isHeartbeatMessage(message: unknown): boolean {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const entry = message as Record<string, unknown>;
+  const role = typeof entry.role === "string" ? entry.role.toLowerCase() : "";
+
+  if (role === "assistant") {
+    const text = typeof entry.text === "string" ? entry.text : extractText(message);
+    return typeof text === "string" && HEARTBEAT_OK_PATTERN.test(text);
+  }
+  if (role === "user") {
+    const text =
+      typeof entry.text === "string"
+        ? entry.text
+        : typeof entry.content === "string"
+          ? entry.content
+          : extractText(message);
+    return typeof text === "string" && text.trimStart().startsWith(HEARTBEAT_PROMPT_PREFIX);
+  }
+  return false;
+}
+`,
+    "chat ui heartbeat filter helper",
+  );
+  chatUi = replaceOrThrow(
+    chatUi,
+    "    state.chatMessages = messages.filter((message) => !isAssistantSilentReply(message));\n",
+    "    state.chatMessages = messages.filter((message) => !isAssistantSilentReply(message) && !isHeartbeatMessage(message));\n",
+    "chat ui history filter",
+  );
+  write(chatUiRel, chatUi);
+}
+
+console.log(
+  JSON.stringify(
+    {
+      patched: true,
+      files: [
+        smRel,
+        convRel,
+        chatServerRel,
+        chatUiRel,
+      ],
+    },
+    null,
+    2,
+  ),
+);
+NODE
+}
+
+apply_official_bestfixes_source() {
+  local applied_any=0
+
+  if try_cherry_pick_commit "$OFFICIAL_DUPLICATE_RETRY_FIX_COMMIT_1"; then
+    applied_any=1
+  fi
+  if try_cherry_pick_commit "$OFFICIAL_DUPLICATE_RETRY_FIX_COMMIT_2"; then
+    applied_any=1
+  fi
+  if try_cherry_pick_commit "$OFFICIAL_HEARTBEAT_POLL_FILTER_COMMIT"; then
+    applied_any=1
+  fi
+
+  if check_official_bestfixes_source; then
+    return 0
+  fi
+
+  apply_official_bestfixes_fallback_patch_source
+  check_official_bestfixes_source
+  if ! git -C "$WORKTREE_DIR" diff --quiet -- \
+    src/agents/pi-embedded-runner/session-manager-init.ts \
+    src/agents/openai-ws-message-conversion.ts \
+    src/gateway/server-methods/chat.ts \
+    ui/src/ui/controllers/chat.ts; then
+    git -C "$WORKTREE_DIR" add \
+      src/agents/pi-embedded-runner/session-manager-init.ts \
+      src/agents/openai-ws-message-conversion.ts \
+      src/gateway/server-methods/chat.ts \
+      ui/src/ui/controllers/chat.ts
+    git -C "$WORKTREE_DIR" commit -m "fix(gateway,agents): backport heartbeat poll filter + fallback retry dedupe"
+  elif [[ "$applied_any" == "1" ]]; then
+    :
+  fi
 }
 
 check_webchat_retry_idempotency_patch_source() {
@@ -925,6 +1332,12 @@ else
     echo "==> Fix commit missing; applying fallback patch"
     apply_fallback_patch
   fi
+fi
+
+echo "==> Checking official best-fix backports (heartbeat poll filter + fallback dedupe)"
+if ! check_official_bestfixes_source; then
+  echo "==> Applying official best-fix backports"
+  apply_official_bestfixes_source
 fi
 
 echo "==> Checking webchat retry/idempotency patch (duplicate send protection)"

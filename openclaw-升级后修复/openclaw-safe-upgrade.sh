@@ -27,6 +27,14 @@ fi
 echo "==> Version after official upgrade"
 openclaw --version
 
+echo "==> Official references for this upgrade flow"
+cat <<'EOF'
+- duplicate user messages on fallback retries: https://github.com/openclaw/openclaw/pull/52903
+  commits: effb9cb3948ed9a8366042093de8a3eaa44875f2, a63afd8ce043405561889c5fcb4f0965ad1edf06
+- heartbeat poll shown in webchat history: https://github.com/openclaw/openclaw/pull/36899 (not merged), issue: https://github.com/openclaw/openclaw/issues/49374
+- composer duplication / accidental prepend: https://github.com/openclaw/openclaw/issues/24022
+EOF
+
 INSTALLED_VERSION="$(openclaw --version | awk 'NR==1 {print $2}')"
 echo "==> Reapplying heartbeat/session/toolMsg fixes on version: $INSTALLED_VERSION"
 "$REAPPLY_SCRIPT" "$INSTALLED_VERSION"
@@ -176,6 +184,30 @@ console.log(
       webchatWsDisconnect: wsDisconnect,
       userMessages,
       duplicateMessageBuckets: duplicateBuckets,
+      heartbeatPollVisibleCount:
+        transcriptPath && fs.existsSync(transcriptPath)
+          ? fs
+              .readFileSync(transcriptPath, "utf8")
+              .split("\n")
+              .filter((line) => {
+                if (!line.trim()) return false;
+                try {
+                  const obj = JSON.parse(line);
+                  const msg = obj?.message;
+                  if (!msg || msg.role !== "user") return false;
+                  const text = typeof msg.content === "string"
+                    ? msg.content
+                    : Array.isArray(msg.content)
+                      ? msg.content.map((c) => (c && typeof c.text === "string" ? c.text : "")).join("\n")
+                      : typeof msg.text === "string"
+                        ? msg.text
+                        : "";
+                  return text.trimStart().startsWith("Read HEARTBEAT.md");
+                } catch {
+                  return false;
+                }
+              }).length
+          : 0,
       note:
         duplicateBuckets > 0
           ? "possible duplicate send/display detected; inspect control-ui retry/idempotency behavior"
