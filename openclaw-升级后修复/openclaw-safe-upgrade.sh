@@ -54,7 +54,7 @@ cleanup_openclaw_staging_dirs() {
   local npm_root
   npm_root="$(npm root -g 2>/dev/null | tr -d '\r')"
   if [[ -n "$npm_root" && -d "$npm_root" ]]; then
-    rm -rf "$npm_root"/.openclaw-* 2>/dev/null || true
+    find "$npm_root" -maxdepth 1 -type d -name '.openclaw-*' -exec rm -rf {} + 2>/dev/null || true
   fi
 }
 
