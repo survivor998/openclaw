@@ -132,7 +132,9 @@ const hasRuntimeHeartbeatFilter =
   (text.includes("HEARTBEAT_OK") || text.includes("HEARTBEAT_TOKEN")) &&
   (
     text.includes("startsWith(HEARTBEAT_PROMPT_PREFIX)") ||
+    text.includes("includes(HEARTBEAT_PROMPT_PREFIX)") ||
     text.includes("startsWith(eT)") ||
+    text.includes("includes(eT)") ||
     text.includes("startsWith(\"Read HEARTBEAT.md\")")
   ) &&
   (
@@ -239,29 +241,52 @@ try {
 } catch {}
 let userMessages = 0;
 let duplicateBuckets = 0;
+let duplicateBucketsNormalized = 0;
+let abortedAssistantPlaceholderCount = 0;
+function extractMessageText(msg) {
+  if (!msg || typeof msg !== "object") return "";
+  if (typeof msg.text === "string") return msg.text;
+  if (typeof msg.content === "string") return msg.content;
+  if (Array.isArray(msg.content)) {
+    return msg.content.map((c) => (c && typeof c.text === "string" ? c.text : "")).join("\n").trim();
+  }
+  return "";
+}
+function normalizeForDedup(text) {
+  return String(text || "")
+    .replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>/gi, "")
+    .replace(/(?:Sender|Conversation info) \(untrusted metadata\):[\s\S]*?\x60\x60\x60[\s\S]*?\x60\x60\x60/gi, "")
+    .replace(/\x60\x60\x60[\s\S]*?\x60\x60\x60/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 if (transcriptPath && fs.existsSync(transcriptPath)) {
   const seen = new Map();
+  const seenNormalized = new Map();
   for (const line of fs.readFileSync(transcriptPath, "utf8").split("\n")) {
     if (!line.trim()) continue;
     let obj;
     try { obj = JSON.parse(line); } catch { continue; }
     const msg = obj?.message;
-    if (!msg || msg.role !== "user") continue;
+    if (!msg) continue;
     const ts = typeof msg.timestamp === "number" ? msg.timestamp : 0;
     if (!ts || ts < since) continue;
-    const text = typeof msg.content === "string"
-      ? msg.content
-      : Array.isArray(msg.content)
-        ? msg.content.map((c) => (c && typeof c.text === "string" ? c.text : "")).join("\n").trim()
-        : typeof msg.text === "string"
-          ? msg.text
-          : "";
+    if (msg.role === "assistant" && msg.stopReason === "aborted") {
+      const t = extractMessageText(msg);
+      if (!t || !t.trim()) abortedAssistantPlaceholderCount += 1;
+    }
+    if (msg.role !== "user") continue;
+    const text = extractMessageText(msg);
     if (!text) continue;
     userMessages += 1;
     const key = `${text}::${msg.idempotencyKey || ""}`;
+    const normalized = normalizeForDedup(text);
+    const keyNormalized = `${normalized}::${msg.idempotencyKey || ""}`;
     seen.set(key, (seen.get(key) || 0) + 1);
+    if (normalized) seenNormalized.set(keyNormalized, (seenNormalized.get(keyNormalized) || 0) + 1);
   }
   duplicateBuckets = [...seen.values()].filter((n) => n > 1).length;
+  duplicateBucketsNormalized = [...seenNormalized.values()].filter((n) => n > 1).length;
 }
 
 console.log(
@@ -272,6 +297,8 @@ console.log(
       webchatWsDisconnect: wsDisconnect,
       userMessages,
       duplicateMessageBuckets: duplicateBuckets,
+      duplicateMessageBucketsNormalized: duplicateBucketsNormalized,
+      abortedAssistantPlaceholderCount,
       heartbeatPollVisibleCount:
         transcriptPath && fs.existsSync(transcriptPath)
           ? fs
@@ -290,15 +317,15 @@ console.log(
                       : typeof msg.text === "string"
                         ? msg.text
                         : "";
-                  return text.trimStart().startsWith("Read HEARTBEAT.md");
+                  return text.includes("Read HEARTBEAT.md");
                 } catch {
                   return false;
                 }
               }).length
           : 0,
       note:
-        duplicateBuckets > 0
-          ? "possible duplicate send/display detected; inspect control-ui retry/idempotency behavior"
+        duplicateBuckets > 0 || duplicateBucketsNormalized > 0
+          ? "duplicate send/display likely; prioritize normalized dedupe + aborted-placeholder filtering backport"
           : "no transcript-level duplicate bucket detected in current main session",
     },
     null,

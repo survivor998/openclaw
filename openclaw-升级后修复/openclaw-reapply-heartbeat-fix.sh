@@ -506,7 +506,11 @@ function stripTrailingOrphanedUserMessages(sm: {
   let lastAssistantIdx = -1;
   for (let i = sm.fileEntries.length - 1; i >= 0; i--) {
     const e = sm.fileEntries[i];
-    if (e.type === "message" && (e as SessionMessageEntry).message?.role === "assistant") {
+    if (
+      e.type === "message" &&
+      (e as SessionMessageEntry).message?.role === "assistant" &&
+      (e as SessionMessageEntry).message?.stopReason !== "aborted"
+    ) {
       lastAssistantIdx = i;
       break;
     }
@@ -567,15 +571,26 @@ function collapseConsecutiveUserMessages(items: InputItem[]): InputItem[] {
   return out;
 }
 
+function normalizeUserInputTextFingerprint(text: string): string {
+  return text
+    .replace(/<relevant-memories>[\\s\\S]*?<\\/relevant-memories>/gi, "")
+    .replace(/(?:Sender|Conversation info) \\(untrusted metadata\\):[\\s\\S]*?\\x60\\x60\\x60[\\s\\S]*?\\x60\\x60\\x60/gi, "")
+    .replace(/\\x60\\x60\\x60[\\s\\S]*?\\x60\\x60\\x60/g, "")
+    .replace(/\\s+/g, " ")
+    .trim();
+}
+
 function inputItemTextFingerprint(item: InputItem): string {
   if (!("content" in item)) return "";
   const content = (item as { content?: unknown }).content;
-  if (typeof content === "string") return content;
+  if (typeof content === "string") return normalizeUserInputTextFingerprint(content);
   if (!Array.isArray(content)) return "";
-  return content
-    .filter((c: { type?: string }) => c.type === "input_text")
-    .map((c: { text?: string }) => c.text ?? "")
-    .join("\\n");
+  return normalizeUserInputTextFingerprint(
+    content
+      .filter((c: { type?: string }) => c.type === "input_text")
+      .map((c: { text?: string }) => c.text ?? "")
+      .join("\\n"),
+  );
 }
 
 `,
@@ -587,7 +602,7 @@ function inputItemTextFingerprint(item: InputItem): string {
 // 2) Backport heartbeat poll/history filtering for webchat.
 const chatServerRel = "src/gateway/server-methods/chat.ts";
 let chatServer = read(chatServerRel);
-if (!chatServer.includes('startsWith("Read HEARTBEAT.md")')) {
+if (!chatServer.includes("Read HEARTBEAT.md")) {
   chatServer = replaceOrThrow(
     chatServer,
     "import { isSilentReplyText, SILENT_REPLY_TOKEN } from \"../../auto-reply/tokens.js\";",
@@ -630,7 +645,20 @@ if (!chatServer.includes('startsWith("Read HEARTBEAT.md")')) {
   if (typeof entry.content === "string") {
     return entry.content;
   }
-  return undefined;
+  if (!Array.isArray(entry.content) || entry.content.length === 0) {
+    return undefined;
+  }
+  const texts: string[] = [];
+  for (const block of entry.content as Array<{ type?: unknown; text?: unknown }>) {
+    if (!block || typeof block !== "object") {
+      return undefined;
+    }
+    if (block.type !== "text" || typeof block.text !== "string") {
+      return undefined;
+    }
+    texts.push(block.text);
+  }
+  return texts.length > 0 ? texts.join("\\n") : undefined;
 }
 
 function isHeartbeatUserPrompt(text: string): boolean {
@@ -638,7 +666,48 @@ function isHeartbeatUserPrompt(text: string): boolean {
   if (!trimmed) {
     return false;
   }
-  return trimmed.startsWith("Read HEARTBEAT.md");
+  return text.includes("Read HEARTBEAT.md");
+}
+
+function isAbortedAssistantPlaceholder(message: unknown): boolean {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const entry = message as Record<string, unknown>;
+  if (entry.role !== "assistant" || entry.stopReason !== "aborted") {
+    return false;
+  }
+  const text = extractAssistantTextForSilentCheck(message);
+  return !text || text.trim().length === 0;
+}
+
+function normalizeUserTextForDedup(text: string): string {
+  return text
+    .replace(/<relevant-memories>[\\s\\S]*?<\\/relevant-memories>/gi, "")
+    .replace(/(?:Sender|Conversation info) \\(untrusted metadata\\):[\\s\\S]*?\\x60\\x60\\x60[\\s\\S]*?\\x60\\x60\\x60/gi, "")
+    .replace(/\\x60\\x60\\x60[\\s\\S]*?\\x60\\x60\\x60/g, "")
+    .replace(/\\s+/g, " ")
+    .trim();
+}
+
+function isDuplicateUserMessageByNormalizedText(prev: unknown, cur: unknown): boolean {
+  const prevText = extractUserTextForHeartbeatCheck(prev);
+  const curText = extractUserTextForHeartbeatCheck(cur);
+  if (!prevText || !curText) {
+    return false;
+  }
+  const a = normalizeUserTextForDedup(prevText);
+  const b = normalizeUserTextForDedup(curText);
+  return Boolean(a) && a === b;
+}
+
+function normalizedUserTextForDedup(message: unknown): string | null {
+  const text = extractUserTextForHeartbeatCheck(message);
+  if (!text) {
+    return null;
+  }
+  const normalized = normalizeUserTextForDedup(text);
+  return normalized || null;
 }
 
 function sanitizeChatHistoryMessages(messages: unknown[]): unknown[] {
@@ -647,6 +716,7 @@ function sanitizeChatHistoryMessages(messages: unknown[]): unknown[] {
   }
   let changed = false;
   const next: unknown[] = [];
+  const userIndexByNormalizedText = new Map<string, number>();
   for (const message of messages) {
     const res = sanitizeChatHistoryMessage(message);
     changed ||= res.changed;
@@ -666,6 +736,27 @@ function sanitizeChatHistoryMessages(messages: unknown[]): unknown[] {
     if (userText !== undefined && isHeartbeatUserPrompt(userText)) {
       changed = true;
       continue;
+    }
+    if (isAbortedAssistantPlaceholder(res.message)) {
+      changed = true;
+      continue;
+    }
+    const normalizedUserText = normalizedUserTextForDedup(res.message);
+    if (normalizedUserText) {
+      const prevIndex = userIndexByNormalizedText.get(normalizedUserText);
+      if (prevIndex !== undefined) {
+        next[prevIndex] = res.message;
+        changed = true;
+        continue;
+      }
+    }
+    if (next.length > 0 && isDuplicateUserMessageByNormalizedText(next[next.length - 1], res.message)) {
+      next[next.length - 1] = res.message;
+      changed = true;
+      continue;
+    }
+    if (normalizedUserText) {
+      userIndexByNormalizedText.set(normalizedUserText, next.length);
     }
     next.push(res.message);
   }
@@ -721,8 +812,30 @@ const HEARTBEAT_PROMPT_PREFIX = "Read HEARTBEAT.md";
   if (typeof entry.text === "string") {
     return isSilentReplyStream(entry.text);
   }
-  const text = extractText(message);
+  const text = readMessageText(message);
   return typeof text === "string" && isSilentReplyStream(text);
+}
+
+function readMessageText(message: unknown): string | null {
+  if (!message || typeof message !== "object") {
+    return null;
+  }
+  const entry = message as Record<string, unknown>;
+  if (typeof entry.text === "string") {
+    return entry.text;
+  }
+  if (typeof entry.content === "string") {
+    return entry.content;
+  }
+  if (!Array.isArray(entry.content)) {
+    return null;
+  }
+  const texts: string[] = [];
+  for (const block of entry.content as Array<{ text?: unknown }>) {
+    if (!block || typeof block !== "object") continue;
+    if (typeof block.text === "string") texts.push(block.text);
+  }
+  return texts.length > 0 ? texts.join("\\n") : null;
 }
 
 function isHeartbeatMessage(message: unknown): boolean {
@@ -733,7 +846,7 @@ function isHeartbeatMessage(message: unknown): boolean {
   const role = typeof entry.role === "string" ? entry.role.toLowerCase() : "";
 
   if (role === "assistant") {
-    const text = typeof entry.text === "string" ? entry.text : extractText(message);
+    const text = typeof entry.text === "string" ? entry.text : readMessageText(message);
     return typeof text === "string" && HEARTBEAT_OK_PATTERN.test(text);
   }
   if (role === "user") {
@@ -742,8 +855,8 @@ function isHeartbeatMessage(message: unknown): boolean {
         ? entry.text
         : typeof entry.content === "string"
           ? entry.content
-          : extractText(message);
-    return typeof text === "string" && text.trimStart().startsWith(HEARTBEAT_PROMPT_PREFIX);
+          : readMessageText(message);
+    return typeof text === "string" && text.includes(HEARTBEAT_PROMPT_PREFIX);
   }
   return false;
 }
@@ -770,11 +883,50 @@ if (!chatUi.includes("isHeartbeatTextStream")) {
   return SILENT_REPLY_PATTERN.test(text);
 }
 function isHeartbeatTextStream(text: string): boolean {
-  const trimmed = text.trimStart();
-  return HEARTBEAT_OK_PATTERN.test(text) || trimmed.startsWith(HEARTBEAT_PROMPT_PREFIX);
+  return HEARTBEAT_OK_PATTERN.test(text) || text.includes(HEARTBEAT_PROMPT_PREFIX);
 }
 `,
   );
+  if (!chatUi.includes("function readMessageText(")) {
+    chatUi = replaceIfPresent(
+      chatUi,
+      `function isSilentReplyStream(text: string): boolean {
+  return SILENT_REPLY_PATTERN.test(text);
+}
+function isHeartbeatTextStream(text: string): boolean {
+  return HEARTBEAT_OK_PATTERN.test(text) || text.includes(HEARTBEAT_PROMPT_PREFIX);
+}
+`,
+      `function isSilentReplyStream(text: string): boolean {
+  return SILENT_REPLY_PATTERN.test(text);
+}
+function readMessageText(message: unknown): string | null {
+  if (!message || typeof message !== "object") {
+    return null;
+  }
+  const entry = message as Record<string, unknown>;
+  if (typeof entry.text === "string") {
+    return entry.text;
+  }
+  if (typeof entry.content === "string") {
+    return entry.content;
+  }
+  if (!Array.isArray(entry.content)) {
+    return null;
+  }
+  const texts: string[] = [];
+  for (const block of entry.content as Array<{ text?: unknown }>) {
+    if (!block || typeof block !== "object") continue;
+    if (typeof block.text === "string") texts.push(block.text);
+  }
+  return texts.length > 0 ? texts.join("\\n") : null;
+}
+function isHeartbeatTextStream(text: string): boolean {
+  return HEARTBEAT_OK_PATTERN.test(text) || text.includes(HEARTBEAT_PROMPT_PREFIX);
+}
+`,
+    );
+  }
   chatUi = replaceIfPresent(
     chatUi,
     `function isHeartbeatMessage(message: unknown): boolean {
@@ -785,7 +937,7 @@ function isHeartbeatTextStream(text: string): boolean {
   const role = typeof entry.role === "string" ? entry.role.toLowerCase() : "";
 
   if (role === "assistant") {
-    const text = typeof entry.text === "string" ? entry.text : extractText(message);
+    const text = typeof entry.text === "string" ? entry.text : readMessageText(message);
     return typeof text === "string" && HEARTBEAT_OK_PATTERN.test(text);
   }
 
@@ -795,8 +947,8 @@ function isHeartbeatTextStream(text: string): boolean {
         ? entry.text
         : typeof entry.content === "string"
           ? entry.content
-          : extractText(message);
-    return typeof text === "string" && text.trimStart().startsWith(HEARTBEAT_PROMPT_PREFIX);
+          : readMessageText(message);
+    return typeof text === "string" && text.includes(HEARTBEAT_PROMPT_PREFIX);
   }
 
   return false;
@@ -810,7 +962,7 @@ function isHeartbeatTextStream(text: string): boolean {
   const role = typeof entry.role === "string" ? entry.role.toLowerCase() : "";
 
   if (role === "assistant") {
-    const text = typeof entry.text === "string" ? entry.text : extractText(message);
+    const text = typeof entry.text === "string" ? entry.text : readMessageText(message);
     return typeof text === "string" && HEARTBEAT_OK_PATTERN.test(text);
   }
 
@@ -820,16 +972,15 @@ function isHeartbeatTextStream(text: string): boolean {
         ? entry.text
         : typeof entry.content === "string"
           ? entry.content
-          : extractText(message);
-    return typeof text === "string" && text.trimStart().startsWith(HEARTBEAT_PROMPT_PREFIX);
+          : readMessageText(message);
+    return typeof text === "string" && text.includes(HEARTBEAT_PROMPT_PREFIX);
   }
 
   return false;
 }
 
 function isHeartbeatTextStream(text: string): boolean {
-  const trimmed = text.trimStart();
-  return HEARTBEAT_OK_PATTERN.test(text) || trimmed.startsWith(HEARTBEAT_PROMPT_PREFIX);
+  return HEARTBEAT_OK_PATTERN.test(text) || text.includes(HEARTBEAT_PROMPT_PREFIX);
 }
 `,
   );

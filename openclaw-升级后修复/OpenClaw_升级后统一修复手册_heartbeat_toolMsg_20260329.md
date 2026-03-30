@@ -1,6 +1,6 @@
 # OpenClaw 升级后统一修复手册（Heartbeat + toolMsg + WebChat 重复显示）
 
-更新时间：2026-03-29 22:05 CST  
+更新时间：2026-03-30 09:20 CST  
 分析报告：`/tmp/openclaw-log-analysis-report-2026-03-29.md`
 
 ## 1. 官方仓库最新结论（2026-03-29）
@@ -10,6 +10,7 @@
 | Heartbeat 污染主会话元数据（`lastTo/deliveryContext/origin` 被 heartbeat 覆盖） | 未确认已在 2026.3.28/2026.3.29 官方包完全覆盖                                                                                                                | 保留源码级修复 + 升级后自动巡检与清理             |
 | `toolMsg.content.filter is not a function`                                      | 仍存在升级后回归风险（依赖链/构建差异）                                                                                                                      | 保留安装后自动检测与热修                          |
 | WebChat 单次输入出现重复 user 消息（fallback/retry 引发）                       | 官方有修复 PR 但未确认已进入你的安装包：[#52903](https://github.com/openclaw/openclaw/pull/52903)                                                            | 脚本优先应用官方 commit，失败则本地 fallback 补丁 |
+| 重试链路残留 `assistant stopReason=aborted` 空消息，放大重复与错位显示            | 官方修复 PR 仍未确认已进入你的安装包：[#48283](https://github.com/openclaw/openclaw/pull/48283)                                                             | 脚本增加 aborted 占位过滤                          |
 | WebChat 显示 heartbeat poll 文本（`Read HEARTBEAT.md...`）                      | 仍为官方已知问题：[#49374](https://github.com/openclaw/openclaw/issues/49374)；对应修复 PR 未合并：[#36899](https://github.com/openclaw/openclaw/pull/36899) | 脚本回补 gateway + UI 过滤                        |
 | Control UI 上一条内容粘到下一条（composer duplication）                         | 官方 open：[#24022](https://github.com/openclaw/openclaw/issues/24022)                                                                                       | 脚本保留队列重试 runId/idempotencyKey 稳定化补丁  |
 
@@ -26,6 +27,7 @@
 
 1. 在 `session-manager-init` 重试前剥离 trailing orphaned user messages。
 2. 在 OpenAI WS 输入转换阶段，对“相邻且相同指纹”的 user message 去重（保留真实不同输入）。
+3. 指纹算法改为“归一化去重”：先剥离 `<relevant-memories>` 与 sender/conversation metadata 再比较，避免“同句一条带记忆一条不带记忆”漏判。
 
 ### 2.2 Heartbeat poll 泄露到 WebChat 历史
 
@@ -52,6 +54,9 @@
 1. UI 从“仅 history 过滤”扩展到“实时事件流过滤”（`handleChatEvent` 的 `delta/final/aborted`）。
 2. 脚本内置 commit 改为 `--no-verify`，避免被 repo hook 打断导致补丁未完整落地。
 3. `openclaw-safe-upgrade.sh` 新增安装后硬校验：检查 control-ui bundle 是否包含 `isHeartbeatTextStream` 运行时过滤逻辑。
+4. 重复消息诊断从“原文桶计数”升级为“原文+归一化双桶计数”，并新增 `abortedAssistantPlaceholderCount` 指标。
+5. heartbeat 文本过滤从“前缀匹配 `startsWith(Read HEARTBEAT.md)`”升级为“包含匹配 `includes(Read HEARTBEAT.md)`”，避免前面带 `System: ...` 时漏过滤。
+6. WebChat 重复 user 去重从“仅相邻消息”升级为“全量归一化去重（同文本保留最新一条）”，覆盖“间隔多条 tool/assistant 后再次回放同一句”的复发路径。
 
 ## 3. 三个文件已经整合的能力
 
