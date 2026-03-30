@@ -128,9 +128,19 @@ if (files.length === 0) {
 const bundlePath = path.join(assetsDir, files.sort().at(-1));
 const text = fs.readFileSync(bundlePath, "utf8");
 const hasRuntimeHeartbeatFilter =
-  text.includes("isHeartbeatTextStream") &&
-  text.includes("HEARTBEAT_PROMPT_PREFIX") &&
-  text.includes("isHeartbeatMessage");
+  text.includes("Read HEARTBEAT.md") &&
+  (text.includes("HEARTBEAT_OK") || text.includes("HEARTBEAT_TOKEN")) &&
+  (
+    text.includes("startsWith(HEARTBEAT_PROMPT_PREFIX)") ||
+    text.includes("startsWith(eT)") ||
+    text.includes("startsWith(\"Read HEARTBEAT.md\")")
+  ) &&
+  (
+    text.includes("&& !isHeartbeatTextStream(") ||
+    text.includes("&&!isHeartbeatTextStream(") ||
+    text.includes("&& !nT(") ||
+    text.includes("&&!nT(")
+  );
 console.log(JSON.stringify({ bundlePath, hasRuntimeHeartbeatFilter }, null, 2));
 if (!hasRuntimeHeartbeatFilter) process.exit(42);
 NODE
