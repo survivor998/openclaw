@@ -630,8 +630,7 @@ if (!chatServer.includes('startsWith("Read HEARTBEAT.md")')) {
   if (typeof entry.content === "string") {
     return entry.content;
   }
-  const extracted = extractText(message);
-  return typeof extracted === "string" ? extracted : undefined;
+  return undefined;
 }
 
 function isHeartbeatUserPrompt(text: string): boolean {
